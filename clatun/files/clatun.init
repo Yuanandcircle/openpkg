@@ -1,0 +1,204 @@
+#!/bin/sh /etc/rc.common
+ 
+START=95
+STOP=01
+EXTRA_COMMANDS="activate"
+
+TUN="utun"
+FW3_FORWARD_CHAIN_NAME="forwarding_rule"
+DNAT_FILTER_CHAIN_NAME="clatun_dnat_filter"
+DNAT_HELPER_CHAIN_NAME="clatun_dnat_helper"
+MANGLE_FILTER_CHAIN_NAME="clatun_mangle_filter"
+MANGLE_HELPER_CHAIN_NAME="clatun_mangle_helper"
+
+ifup() {
+    validate_init_config $1
+
+    [ $enabled -ne 0 ] || exit 0
+
+    ip link set $TUN up 2> /dev/null
+    ip route replace default dev $TUN table $fwmark 2> /dev/null
+    if [ $ipv6 -ne 0 ]; then
+        ip -6 route replace default dev $TUN table $fwmark 2> /dev/null
+    fi
+}
+
+init() {
+    validate_init_config $1
+
+    [ $enabled -ne 0 ] || exit 0
+
+    ip rule add fwmark $fwmark lookup $fwmark
+    ip -6 rule add fwmark $fwmark lookup $fwmark
+
+    iptables -t nat -N $DNAT_FILTER_CHAIN_NAME
+    iptables -t nat -N $DNAT_HELPER_CHAIN_NAME
+    iptables -t mangle -N $MANGLE_FILTER_CHAIN_NAME
+    iptables -t mangle -N $MANGLE_HELPER_CHAIN_NAME
+    ip6tables -t nat -N $DNAT_FILTER_CHAIN_NAME
+    ip6tables -t nat -N $DNAT_HELPER_CHAIN_NAME
+    ip6tables -t mangle -N $MANGLE_FILTER_CHAIN_NAME
+    ip6tables -t mangle -N $MANGLE_HELPER_CHAIN_NAME
+
+    iptables -A $FW3_FORWARD_CHAIN_NAME -o $TUN -j ACCEPT
+    ip6tables -A $FW3_FORWARD_CHAIN_NAME -o $TUN -j ACCEPT
+
+    iptables -t nat -A PREROUTING -j $DNAT_FILTER_CHAIN_NAME
+    ip6tables -t nat -A PREROUTING -j $DNAT_FILTER_CHAIN_NAME
+
+    iptables -t mangle -A PREROUTING -j $MANGLE_FILTER_CHAIN_NAME
+    ip6tables -t mangle -A PREROUTING -j $MANGLE_FILTER_CHAIN_NAME
+
+    iptables -t mangle -A $MANGLE_HELPER_CHAIN_NAME -p tcp -j MARK --set-mark $fwmark
+    ip6tables -t mangle -A $MANGLE_HELPER_CHAIN_NAME -p tcp -j MARK --set-mark $fwmark
+
+    if [ $udp -ne 0 ]; then
+        iptables -t mangle -A $MANGLE_HELPER_CHAIN_NAME -p udp -j MARK --set-mark $fwmark
+        ip6tables -t mangle -A $MANGLE_HELPER_CHAIN_NAME -p udp -j MARK --set-mark $fwmark
+    fi
+}
+
+configure_device() {
+    validate_device_config $1
+
+    iptables -t nat -A $DNAT_FILTER_CHAIN_NAME -i $iface -m mac --mac-source $mac -j $DNAT_HELPER_CHAIN_NAME
+    ip6tables -t nat -A $DNAT_FILTER_CHAIN_NAME -i $iface -m mac --mac-source $mac -j $DNAT_HELPER_CHAIN_NAME
+
+    iptables -t mangle -A $MANGLE_FILTER_CHAIN_NAME -i $iface -m mac --mac-source $mac -j $MANGLE_HELPER_CHAIN_NAME
+    ip6tables -t mangle -A $MANGLE_FILTER_CHAIN_NAME -i $iface -m mac --mac-source $mac -j $MANGLE_HELPER_CHAIN_NAME
+}
+
+configure_dns() {
+    validate_dns_config $1
+
+    [ $enabled -ne 0 ] || return 0
+
+    iptables -t nat -A $DNAT_HELPER_CHAIN_NAME -p tcp --dport 53 -j REDIRECT --to-ports $port
+    iptables -t nat -A $DNAT_HELPER_CHAIN_NAME -p udp --dport 53 -j REDIRECT --to-ports $port
+    ip6tables -t nat -A $DNAT_HELPER_CHAIN_NAME -p tcp --dport 53 -j REDIRECT --to-ports $port
+    ip6tables -t nat -A $DNAT_HELPER_CHAIN_NAME -p udp --dport 53 -j REDIRECT --to-ports $port
+
+    iptables -t mangle -I $MANGLE_HELPER_CHAIN_NAME -p tcp --dport 53 -j RETURN
+    iptables -t mangle -I $MANGLE_HELPER_CHAIN_NAME -p udp --dport 53 -j RETURN
+    ip6tables -t mangle -I $MANGLE_HELPER_CHAIN_NAME -p tcp --dport 53 -j RETURN
+    ip6tables -t mangle -I $MANGLE_HELPER_CHAIN_NAME -p udp --dport 53 -j RETURN
+}
+
+configure_bypass() {
+    validate_bypass_config $1
+
+    if [ $type = "proto" ]; then
+        if ( [ $dst_port -ne 0 ] && [ $src_port -ne 0 ] ); then
+            iptables -t mangle -I $MANGLE_HELPER_CHAIN_NAME -p $proto --sport $src_port --dport $dst_port -j RETURN
+            ip6tables -t mangle -I $MANGLE_HELPER_CHAIN_NAME -p $proto --sport $src_port --dport $dst_port -j RETURN
+        else
+            [ $dst_port -ne 0 ] && iptables -t mangle -I $MANGLE_HELPER_CHAIN_NAME -p $proto --dport $dst_port -j RETURN
+            [ $dst_port -ne 0 ] && ip6tables -t mangle -I $MANGLE_HELPER_CHAIN_NAME -p $proto --dport $dst_port -j RETURN
+            [ $src_port -ne 0 ] && iptables -t mangle -I $MANGLE_HELPER_CHAIN_NAME -p $proto --sport $src_port -j RETURN
+            [ $src_port -ne 0 ] && ip6tables -t mangle -I $MANGLE_HELPER_CHAIN_NAME -p $proto --sport $src_port -j RETURN
+        fi
+    elif [ $type = "ipv4" ]; then
+        for addr in $dst_addr; do
+            iptables -t mangle -I $MANGLE_HELPER_CHAIN_NAME -d $addr -j RETURN
+        done
+    elif [ $type = "ipv6" ]; then
+        for addr in $dst_addr; do
+            ip6tables -t mangle -I $MANGLE_HELPER_CHAIN_NAME -d $addr -j RETURN
+        done
+    fi
+}
+
+deconfigure() {
+    validate_init_config $1
+
+    ip rule del fwmark $fwmark lookup $fwmark 2> /dev/null
+    ip -6 rule del fwmark $fwmark lookup $fwmark 2> /dev/null
+    iptables -D $FW3_FORWARD_CHAIN_NAME -o $TUN -j ACCEPT 2> /dev/null
+    ip6tables -D $FW3_FORWARD_CHAIN_NAME -o $TUN -j ACCEPT 2> /dev/null
+    iptables -t nat -D PREROUTING -j $DNAT_FILTER_CHAIN_NAME 2> /dev/null
+    ip6tables -t nat -D PREROUTING -j $DNAT_FILTER_CHAIN_NAME 2> /dev/null
+    iptables -t mangle -D PREROUTING -j $MANGLE_FILTER_CHAIN_NAME 2> /dev/null
+    ip6tables -t mangle -D PREROUTING -j $MANGLE_FILTER_CHAIN_NAME 2> /dev/null
+    iptables -t nat -F $DNAT_FILTER_CHAIN_NAME 2> /dev/null
+    iptables -t nat -F $DNAT_HELPER_CHAIN_NAME 2> /dev/null
+    iptables -t mangle -F $MANGLE_FILTER_CHAIN_NAME 2> /dev/null
+    iptables -t mangle -F $MANGLE_HELPER_CHAIN_NAME 2> /dev/null
+    ip6tables -t nat -F $DNAT_FILTER_CHAIN_NAME 2> /dev/null
+    ip6tables -t nat -F $DNAT_HELPER_CHAIN_NAME 2> /dev/null
+    ip6tables -t mangle -F $MANGLE_FILTER_CHAIN_NAME 2> /dev/null
+    ip6tables -t mangle -F $MANGLE_HELPER_CHAIN_NAME 2> /dev/null
+    iptables -t nat -X $DNAT_FILTER_CHAIN_NAME 2> /dev/null
+    iptables -t nat -X $DNAT_HELPER_CHAIN_NAME 2> /dev/null
+    iptables -t mangle -X $MANGLE_FILTER_CHAIN_NAME 2> /dev/null
+    iptables -t mangle -X $MANGLE_HELPER_CHAIN_NAME 2> /dev/null
+    ip6tables -t nat -X $DNAT_FILTER_CHAIN_NAME 2> /dev/null
+    ip6tables -t nat -X $DNAT_HELPER_CHAIN_NAME 2> /dev/null
+    ip6tables -t mangle -X $MANGLE_FILTER_CHAIN_NAME 2> /dev/null
+    ip6tables -t mangle -X $MANGLE_HELPER_CHAIN_NAME 2> /dev/null
+}
+
+activate() {
+    config_load clatun
+    config_foreach ifup clatun
+}
+
+start() {
+    config_load clatun
+    config_foreach deconfigure clatun
+    config_foreach init clatun
+    config_foreach configure_device device
+    config_foreach configure_dns dns
+    config_foreach configure_bypass bypass
+}
+
+stop() {
+    config_load clatun
+    config_foreach deconfigure clatun
+}
+
+uci_validate_section() {
+    local _package=$1
+    local _type=$2
+    local _name=$3
+    local _result
+    local _error
+    shift; shift; shift
+    _result=$(/sbin/validate_data $_package $_type $_name $@ 2> /dev/null)
+    _error=$?
+    eval $_result
+    [ $_error = 0 ] || $(/sbin/validate_data $_package $_type $_name $@ 1> /dev/null)
+    return $_error
+}
+
+validate_init_config() {
+    uci_validate_section clatun clatun $1 \
+        'enabled:bool:0' \
+        'ipv6:bool:0' \
+        'udp:bool:0' \
+        'fwmark:range(0,253):162'
+    [ $? -ne 0 ] && exit 1
+}
+
+validate_device_config() {
+    uci_validate_section clatun device $1 \
+        'iface:string' \
+        'mac:macaddr'
+    [ $? -ne 0 ] && exit 1
+}
+
+validate_dns_config() {
+    uci_validate_section clatun dns $1 \
+        'enabled:bool:0' \
+        'port:port'
+    [ $? -ne 0 ] && exit 1
+}
+
+validate_bypass_config() {
+    uci_validate_section clatun bypass $1 \
+        'type:string' \
+        'proto:string' \
+        'dst_port:port:0' \
+        'src_port:port:0' \
+        'dst_addr:list(cidr)'
+    [ $? -ne 0 ] && exit 1
+}
